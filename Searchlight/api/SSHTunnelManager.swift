@@ -18,6 +18,8 @@ enum SSHTunnelError: Error, LocalizedError {
     case portForwardingFailed
     case tunnelNotEstablished
     case invalidKeyPath
+    case invalidArgument(String)
+    case knownHostsUnavailable(String)
 
     var errorDescription: String? {
         switch self {
@@ -31,6 +33,10 @@ enum SSHTunnelError: Error, LocalizedError {
             return "SSH tunnel is not established."
         case .invalidKeyPath:
             return "Invalid SSH key path. Please provide a valid path to your private key."
+        case .invalidArgument(let message):
+            return "Invalid SSH tunnel setting: \(message)"
+        case .knownHostsUnavailable(let message):
+            return "Cannot prepare known_hosts file for host key verification: \(message)"
         }
     }
 }
@@ -61,6 +67,15 @@ class SSHTunnelManager {
         print("  SSH Key: \(configuration.keyPath)")
         print("  Remote Target: \(remoteHost):\(remotePort)")
 
+        // Values starting with "-" would be parsed by ssh as options (e.g. -oProxyCommand=...)
+        for (label, value) in [("SSH host", configuration.host), ("SSH user", configuration.user), ("database host", remoteHost)] {
+            if value.isEmpty || value.hasPrefix("-") || value.contains(where: { $0.isWhitespace }) {
+                throw SSHTunnelError.invalidArgument("\(label) \"\(value)\" must not be empty, start with \"-\" or contain whitespace")
+            }
+        }
+
+        let knownHostsPath = try prepareKnownHostsFile()
+
         // Find available local port
         self.localPort = try findAvailablePort()
 
@@ -70,11 +85,19 @@ class SSHTunnelManager {
         // Build SSH command
         let arguments = [
             "-N",  // Don't execute remote command
-            "-L", "\(localPort):\(remoteHost):\(remotePort)",  // Local port forwarding
+            // Local port forwarding, bound only to the address the app connects to: without a bind address ssh
+            // also listens on ::1 and treats the forward as successful if either bind works
+            "-L", "127.0.0.1:\(localPort):\(remoteHost):\(remotePort)",
             "-p", "\(configuration.port)",  // SSH port
             "-i", expandedKeyPath,  // Identity file (private key)
-            "-o", "StrictHostKeyChecking=no",  // Don't ask about host key
-            "-o", "UserKnownHostsFile=/dev/null",  // Don't save host key
+            // Trust on first use: unknown hosts are recorded, a changed host key aborts the connection.
+            // The sandboxed ssh process cannot read ~/.ssh/known_hosts, so the app keeps its own file.
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=\"\(knownHostsPath)\"",  // quoted: the path contains "Application Support"
+            "-o", "BatchMode=yes",  // Never prompt; there is no TTY
+            // Exit if the local port cannot be bound (e.g. taken in the meantime), instead of running
+            // without a forward while another process answers on that port
+            "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=60",  // Keep connection alive
             "-o", "ServerAliveCountMax=3",  // Number of keep-alive messages
             "\(configuration.user)@\(configuration.host)"
@@ -152,6 +175,26 @@ class SSHTunnelManager {
         self.localPort = 0
 
         print("ssh tunnel closed")
+    }
+
+    /// Returns the path of the app's own known_hosts file, creating its directory if needed.
+    /// Located in the app container: ~/Library/Containers/<bundle id>/Data/Library/Application Support/Searchlight/known_hosts
+    private func prepareKnownHostsFile() throws -> String {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw SSHTunnelError.knownHostsUnavailable("Application Support directory not found")
+        }
+        let directory = appSupport.appendingPathComponent("Searchlight", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        } catch {
+            throw SSHTunnelError.knownHostsUnavailable(error.localizedDescription)
+        }
+        let path = directory.appendingPathComponent("known_hosts").path
+        if path.contains("\"") {
+            // The path is passed to ssh in double quotes
+            throw SSHTunnelError.knownHostsUnavailable("path contains a double quote: \(path)")
+        }
+        return path
     }
 
     /// Finds an available port for local forwarding

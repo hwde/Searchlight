@@ -74,30 +74,28 @@ class PostgresLSPManager: ObservableObject {
         let host = tunnelPort != nil ? "127.0.0.1" : config.host
         let port = tunnelPort ?? config.port
 
-        // Build config as a proper JSON string to avoid escaping issues
-        let configJSON = """
-        {
-          "$schema": "https://pg-language-server.com/0.18.0/schema.json",
-          "db": {
-            "host": "\(host)",
-            "port": \(port),
-            "username": "\(config.user)",
-            "password": "\(config.password)",
-            "database": "\(config.database)",
-            "connTimeoutSecs": 10,
-            "disableConnection": false
-          },
-          "linter": {
-            "enabled": true,
-            "rules": {
-              "recommended": true
-            }
-          }
-        }
-        """
-
-        guard let jsonData = configJSON.data(using: .utf8) else {
-            throw PostgresLSPError.processStartFailed("Failed to encode config JSON")
+        // Build the config with JSONSerialization so values (e.g. passwords with quotes) are escaped correctly
+        let configObject: [String: Any] = [
+            "$schema": "https://pg-language-server.com/0.18.0/schema.json",
+            "db": [
+                "host": host,
+                "port": port,
+                "username": config.user,
+                "password": config.password,
+                "database": config.database,
+                "connTimeoutSecs": 10,
+                "disableConnection": false,
+            ] as [String: Any],
+            "linter": [
+                "enabled": true,
+                "rules": ["recommended": true],
+            ] as [String: Any],
+        ]
+        let jsonData: Data
+        do {
+            jsonData = try JSONSerialization.data(withJSONObject: configObject, options: [.prettyPrinted, .sortedKeys])
+        } catch {
+            throw PostgresLSPError.processStartFailed("Failed to encode config JSON: \(error.localizedDescription)")
         }
 
         // The LSP creates a Unix socket in the config directory.
@@ -109,11 +107,14 @@ class PostgresLSPManager: ObservableObject {
 
         // Create the actual config directory in container temp (sandbox-writable)
         let actualDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pglsp-\(shortId)")
-        try FileManager.default.createDirectory(at: actualDir, withIntermediateDirectories: true)
+        // The config contains the database password: keep directory and file private to the user
+        try FileManager.default.createDirectory(at: actualDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 
         // Write config file - must be named postgres-language-server.jsonc
         let configFile = actualDir.appendingPathComponent("postgres-language-server.jsonc")
-        try jsonData.write(to: configFile)
+        guard FileManager.default.createFile(atPath: configFile.path, contents: jsonData, attributes: [.posixPermissions: 0o600]) else {
+            throw PostgresLSPError.processStartFailed("Failed to write config file \(configFile.path)")
+        }
 
         self.configDirectory = actualDir
 
@@ -225,6 +226,11 @@ class PostgresLSPManager: ObservableObject {
 
         var env = ProcessInfo.processInfo.environment
         env["HOME"] = shortHomePath
+        // The language server opens its own database connection (sqlx). Its config has no TLS option, but sqlx
+        // reads PGSSLMODE; without it sqlx uses "prefer" and silently falls back to plain text. The bundled
+        // build has no TLS backend, so "require"/"verify-full" make its connection fail instead of downgrading
+        // (schema-based completion is then unavailable, the editor still works).
+        env["PGSSLMODE"] = config.sslMode.rawValue
         // Enable verbose logging for debugging
         env["PGT_LOG_KIND"] = "trace"
         env["PGLS_LOG_KIND"] = "trace"
