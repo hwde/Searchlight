@@ -19,14 +19,14 @@ enum ConnectionDefaults {
     static let username = "postgres"
 }
 
-/// Connection configuration section with host, port, database, credentials, and SSL
+/// Connection configuration section with host, port, database, credentials, and SSL mode
 struct ConnectionSection: View {
     @Binding var host: String
     @Binding var port: Int?
     @Binding var database: String
     @Binding var username: String
     @Binding var password: String
-    @Binding var useSSL: Bool
+    @Binding var sslMode: SSLMode
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,10 +36,15 @@ struct ConnectionSection: View {
             FormTextField(label: "Username", text: $username, placeholder: ConnectionDefaults.username, showDivider: true)
             FormTextField(label: "Password", text: $password, placeholder: "Enter password", showDivider: true, isSecure: true)
 
-            FormFieldRow(label: "Use SSL", showDivider: false) {
-                Toggle("", isOn: $useSSL)
-                    .toggleStyle(.switch)
-                    .labelsHidden()
+            FormFieldRow(label: "SSL Mode", showDivider: false) {
+                Picker("SSL Mode", selection: $sslMode) {
+                    ForEach(SSLMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .fixedSize()
             }
         }
     }
@@ -53,7 +58,7 @@ struct ConnectionSection: View {
             database: .constant("mydb"),
             username: .constant("postgres"),
             password: .constant(""),
-            useSSL: .constant(true)
+            sslMode: .constant(.verifyFull)
         )
     }
     .padding()

@@ -18,6 +18,7 @@ struct FavoriteConnectionsView: View {
     @StateObject private var favoriteStore = FavoritesStore.shared
     @Binding var selectedConnection: DatabaseConnectionConfiguration
     @State private var selectedConnectionID: String?
+    @State private var removeErrorMessage: String?
 
     private let newConnectionConfig = DatabaseConnectionConfiguration(
         name: "",
@@ -25,7 +26,7 @@ struct FavoriteConnectionsView: View {
         database: "",
         user: "",
         password: "",
-        ssl: true,
+        sslMode: .verifyFull,
         favorited: false,
         sshTunnel: nil
     )
@@ -37,6 +38,13 @@ struct FavoriteConnectionsView: View {
     var body: some View {
         List(selection: $selectedConnectionID) {
             Section {
+                if let problem = favoriteStore.loadProblem {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                }
                 if favoriteStore.favorites.isEmpty {
                     EmptyFavoritesView()
                         .listRowBackground(Color.clear)
@@ -78,6 +86,14 @@ struct FavoriteConnectionsView: View {
             ))
         }
         .listStyle(.sidebar)
+        .alert("Favorite not deleted", isPresented: Binding(
+            get: { removeErrorMessage != nil },
+            set: { if !$0 { removeErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(removeErrorMessage ?? "")
+        }
         .onChange(of: selectedConnectionID) { _, newID in
             if let newID, let connection = favoriteStore.favorites.first(where: { $0.id == newID }) {
                 selectedConnection = connection
@@ -136,7 +152,11 @@ struct FavoriteConnectionsView: View {
                 .disabled(true)
 
                 Button(role: .destructive) {
-                    favoriteStore.removeFavorite(databaseConnectionConfiguration: connection)
+                    do {
+                        try favoriteStore.removeFavorite(databaseConnectionConfiguration: connection)
+                    } catch {
+                        removeErrorMessage = "Could not delete \"\(connection.name)\": \(error.localizedDescription)"
+                    }
                 } label: {
                     Label("Delete \"\(connection.name)\"", systemImage: "trash")
                 }
@@ -160,7 +180,7 @@ struct FavoriteConnectionsView: View {
         database: "",
         user: "",
         password: "",
-        ssl: true,
+        sslMode: .verifyFull,
         favorited: false,
         sshTunnel: nil
     )

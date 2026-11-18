@@ -32,7 +32,34 @@ class PostgresConnection {
 
     init(configuration: DatabaseConnectionConfiguration) async throws {
         self.configuration = configuration
-        eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+
+        let usesTunnel = configuration.sshTunnel?.enabled == true
+
+        // Through an SSH tunnel the TLS connection goes to 127.0.0.1. A hostname can still be verified via
+        // SNI/tlsServerName, but an IP address cannot be passed that way, so NIOSSL would check the certificate
+        // against 127.0.0.1 instead of the database. Refuse instead of verifying the wrong identity.
+        if configuration.sslMode == .verifyFull && usesTunnel && PostgresConnection.isIPAddress(configuration.host) {
+            throw NSError(domain: "postgres-mac-client", code: 1, userInfo: [NSLocalizedDescriptionKey: "SSL Mode \"Verify full\" through an SSH tunnel needs the database host as a hostname, not an IP address (\(configuration.host)). Use the hostname from the server certificate, or choose \"Require\"."])
+        }
+
+        // Build the TLS settings before starting the tunnel, so a failure here cannot leave an ssh process behind
+        let tls: PostgresNIO.PostgresConnection.Configuration.TLS
+        switch configuration.sslMode {
+        case .disable:
+            tls = .disable
+        case .require:
+            // Encrypts, but does not authenticate the server (libpq sslmode=require).
+            // Meant for local port forwards where the certificate cannot match 127.0.0.1.
+            var tlsConfig = TLSConfiguration.makeClientConfiguration()
+            tlsConfig.certificateVerification = .none
+            tls = .require(try NIOSSLContext(configuration: tlsConfig))
+        case .verifyFull:
+            // Verifies the certificate chain against the system trust store and the hostname
+            // (or, for an IP address host, the IP against the certificate's IP SANs).
+            var tlsConfig = TLSConfiguration.makeClientConfiguration()
+            tlsConfig.certificateVerification = .fullVerification
+            tls = .require(try NIOSSLContext(configuration: tlsConfig))
+        }
 
         // Establish SSH tunnel if configured
         let connectionHost: String
@@ -58,27 +85,43 @@ class PostgresConnection {
             connectionPort = configuration.port
         }
 
-        // Disabling certificate validation so it can work out of the box with certain hosts (ie.: AWS RDS)
-        // TODO: make this optional instead of the default
-        var tlsConfig = TLSConfiguration.makeClientConfiguration()
-        tlsConfig.certificateVerification = .none
-
         // Map our internal config struct into the NIO config
-        let postgresNIOSqlConfiguration = SQLPostgresConfiguration(
+        var postgresNIOSqlConfiguration = SQLPostgresConfiguration(
             hostname: connectionHost,
             port: connectionPort,
             username: configuration.user,
             password: configuration.password,
             database: configuration.database,
-            tls: configuration.ssl ? .require(try! NIOSSLContext(configuration: tlsConfig)) : .disable
+            tls: tls
         )
-        
+        // Through an SSH tunnel we connect to 127.0.0.1, but the certificate belongs to the real database host,
+        // so SNI and hostname verification must use that name. (IP hosts with verify-full are rejected above.)
+        if usesTunnel && !PostgresConnection.isIPAddress(configuration.host) {
+            postgresNIOSqlConfiguration.coreConfiguration.options.tlsServerName = configuration.host
+        }
+
+        // Created last: nothing above can fail after this point, so the group cannot leak from a failed init
+        eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
         let connectionSource = PostgresConnectionSource(sqlConfiguration: postgresNIOSqlConfiguration)
         connectionPool = EventLoopGroupConnectionPool(
             source: connectionSource,
             maxConnectionsPerEventLoop: 2,
             on: eventLoopGroup
         )
+    }
+
+    private static func isIPAddress(_ host: String) -> Bool {
+        // Accept bracketed IPv6 ("[::1]") and zone IDs ("fe80::1%en0") as IP addresses too
+        var address = host
+        if address.hasPrefix("[") && address.hasSuffix("]") {
+            address = String(address.dropFirst().dropLast())
+        }
+        if let zone = address.firstIndex(of: "%") {
+            address = String(address[..<zone])
+        }
+        var ipv4 = in_addr()
+        var ipv6 = in6_addr()
+        return inet_pton(AF_INET, address, &ipv4) == 1 || inet_pton(AF_INET6, address, &ipv6) == 1
     }
 
     /// Closes the connection pool and event loop group.
@@ -149,10 +192,21 @@ class PostgresConnection {
             // TODO create an Error implementation
             switch error.code {
             case .sslUnsupported:
-                throw NSError(domain: "postgres-mac-client", code: 1, userInfo: [NSLocalizedDescriptionKey: "SSL is not supported. Try unchecking the Use SSL checkbox in the configuration."])
+                throw NSError(domain: "postgres-mac-client", code: 1, userInfo: [NSLocalizedDescriptionKey: "The server refused SSL. This can be a server without SSL support, but also an attacker between you and the server. Only set SSL Mode to \"Disable\" if you trust the network path: the password and all data are then sent unencrypted."])
             case .server:
                 throw NSError(domain: "postgres-mac-client", code: 1, userInfo: [NSLocalizedDescriptionKey: error.serverInfo![.message]!])
-            case .connectionError:
+            case .connectionError, .failedToAddSSLHandler:
+                // PostgresNIO wraps TLS handshake and certificate failures as connection errors too
+                if let underlying = error.underlying,
+                   underlying is NIOSSLError || underlying is BoringSSLError || underlying is NIOSSLExtraError {
+                    let hint = configuration.sslMode == .verifyFull
+                        ? " With \"\(SSLMode.verifyFull.displayName)\" the server certificate must be trusted by macOS and match the host name; for a self-signed or private CA certificate choose \"\(SSLMode.require.displayName)\"."
+                        : ""
+                    throw NSError(domain: "postgres-mac-client", code: 1, userInfo: [NSLocalizedDescriptionKey: "TLS handshake failed with SSL Mode \"\(configuration.sslMode.displayName)\": \(underlying).\(hint)"])
+                }
+                if error.code == .failedToAddSSLHandler {
+                    throw NSError(domain: "postgres-mac-client", code: 1, userInfo: [NSLocalizedDescriptionKey: "TLS could not be set up with SSL Mode \"\(configuration.sslMode.displayName)\": \(error.underlying.map { String(describing: $0) } ?? "unknown error")."])
+                }
                 throw NSError(domain: "postgres-mac-client", code: 1, userInfo: [NSLocalizedDescriptionKey: "Check your hostname and port."])
             default:
                 throw error

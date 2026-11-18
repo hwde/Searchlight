@@ -12,7 +12,6 @@
 
 import Foundation
 import SwiftUI
-import PostgresKit
 import AppKit
 
 struct DatabaseConnectionView: View {
@@ -22,7 +21,11 @@ struct DatabaseConnectionView: View {
     @State private var database: String = ""
     @State private var username: String = ""
     @State private var password: String = ""
-    @State private var useSSL: Bool = true
+    // Password as loaded from the selected favorite, to tell an untouched empty field from one the user cleared
+    @State private var loadedPassword: String = ""
+    // Name of the favorite the form was loaded from (the Keychain account loadedPassword belongs to)
+    @State private var loadedName: String = ""
+    @State private var sslMode: SSLMode = .verifyFull
 
     // SSH Tunnel configuration
     @State private var useSSHTunnel: Bool = false
@@ -36,6 +39,8 @@ struct DatabaseConnectionView: View {
     @State private var selectedColorHex: String? = nil
 
     @State private var connectionValidity: ConnectionValidityState = .untested
+    // Message of the last failed "Save as Favorite", to recognise that banner if nothing has replaced it since
+    @State private var lastSaveErrorMessage: String?
 
     @StateObject private var keyEventMonitor = KeyEventMonitor()
 
@@ -59,7 +64,7 @@ struct DatabaseConnectionView: View {
                         database: $database,
                         username: $username,
                         password: $password,
-                        useSSL: $useSSL
+                        sslMode: $sslMode
                     )
                 }
 
@@ -169,7 +174,9 @@ struct DatabaseConnectionView: View {
             self.database = config.database
             self.username = config.user
             self.password = config.password
-            self.useSSL = config.ssl
+            self.loadedPassword = config.password
+            self.loadedName = config.name
+            self.sslMode = config.sslMode
 
             // Load color customization
             self.selectedColorHex = config.favoriteColor
@@ -225,7 +232,22 @@ struct DatabaseConnectionView: View {
         }
 
         let config = stateToDatabaseConnection(markAsFavorited: true)
-        FavoritesStore.shared.saveFavorite(databaseConnectionConfiguration: config)
+        do {
+            // Saving under another favorite's name must never keep that favorite's stored password
+            let passwordEdited = password != loadedPassword || connectionName != loadedName
+            try FavoritesStore.shared.saveFavorite(databaseConnectionConfiguration: config, passwordEdited: passwordEdited)
+            loadedPassword = password
+            loadedName = connectionName
+            // Clear the banner of a previous failed save, but not unrelated connection errors
+            if case .invalid(let message) = connectionValidity, message == lastSaveErrorMessage {
+                connectionValidity = .untested
+            }
+            lastSaveErrorMessage = nil
+        } catch {
+            let message = "Saving favorite failed: \(error.localizedDescription)"
+            self.connectionValidity = .invalid(message)
+            lastSaveErrorMessage = message
+        }
     }
 
     private func connect() {
@@ -292,24 +314,11 @@ struct DatabaseConnectionView: View {
             database: resolvedDatabase,
             user: resolvedUsername,
             password: password,
-            ssl: useSSL,
+            sslMode: sslMode,
             favorited: markAsFavorited ? true : appState.selectedDatabaseConnectionConfiguration.favorited,
             sshTunnel: sshConfig,
             favoriteColor: selectedColorHex,
             favoriteIcon: "star.fill"
-        )
-    }
-
-    private func stateToConfig() -> SQLPostgresConfiguration {
-        let context = try! NIOSSLContext(configuration: TLSConfiguration.makeClientConfiguration())
-
-        return SQLPostgresConfiguration(
-            hostname: resolvedHost,
-            port: resolvedPort,
-            username: resolvedUsername,
-            password: password,
-            database: resolvedDatabase,
-            tls: useSSL ? .require(context) : .disable
         )
     }
 
